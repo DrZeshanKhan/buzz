@@ -1070,7 +1070,8 @@ pub async fn cmd_set_add_policy(
         }
     }
 
-    let content = build_agent_profile_content(policy, profile_json)?;
+    let profile_json = profile_json.map(read_or_stdin).transpose()?;
+    let content = build_agent_profile_content(policy, profile_json.as_deref())?;
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
