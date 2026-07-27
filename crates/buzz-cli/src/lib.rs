@@ -672,6 +672,11 @@ pub enum ChannelsCmd {
         /// Policy: anyone | owner_only | nobody
         #[arg(long)]
         policy: String,
+        /// Optional JSON object containing agent-directory profile fields.
+        /// Use "-" to read the JSON from stdin. The policy field is always
+        /// overwritten by --policy.
+        #[arg(long, value_name = "JSON")]
+        profile_json: Option<String>,
     },
 }
 

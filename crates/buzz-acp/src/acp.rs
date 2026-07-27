@@ -20,6 +20,10 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Maximum assistant text retained for the host-side reply fallback.
+/// Matches the normal Buzz CLI message limit.
+const MAX_TURN_AGENT_TEXT_BYTES: usize = 65_536;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -200,6 +204,11 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Assistant text emitted since the most recent tool call in this turn.
+    /// The final non-empty segment is used by the host-side reply fallback.
+    turn_agent_text: String,
+    /// Last non-empty assistant segment captured before a tool call.
+    previous_turn_agent_text: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -496,6 +505,8 @@ impl AcpClient {
             active_run_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_agent_text: String::new(),
+            previous_turn_agent_text: String::new(),
         })
     }
 
@@ -688,6 +699,8 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.turn_agent_text.clear();
+        self.previous_turn_agent_text.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -782,6 +795,43 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Consume the last non-empty assistant text segment from this turn.
+    ///
+    /// A tool call starts a new segment. This avoids concatenating the text
+    /// emitted alongside a tool request with the final text emitted after the
+    /// tool result.
+    pub fn take_turn_agent_text(&mut self) -> Option<String> {
+        let current = std::mem::take(&mut self.turn_agent_text);
+        let previous = std::mem::take(&mut self.previous_turn_agent_text);
+        let selected = if current.trim().is_empty() {
+            previous
+        } else {
+            current
+        };
+        let selected = selected.trim();
+        (!selected.is_empty()).then(|| selected.to_owned())
+    }
+
+    fn append_turn_agent_text(&mut self, text: &str) {
+        let remaining = MAX_TURN_AGENT_TEXT_BYTES.saturating_sub(self.turn_agent_text.len());
+        if remaining == 0 {
+            return;
+        }
+        let mut end = text.len().min(remaining);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.turn_agent_text.push_str(&text[..end]);
+    }
+
+    fn start_new_turn_agent_text_segment(&mut self) {
+        if !self.turn_agent_text.trim().is_empty() {
+            self.previous_turn_agent_text = std::mem::take(&mut self.turn_agent_text);
+        } else {
+            self.turn_agent_text.clear();
+        }
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1535,10 +1585,12 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    self.append_turn_agent_text(text);
                 }
                 false
             }
             "tool_call" => {
+                self.start_new_turn_agent_text_segment();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -3061,6 +3113,89 @@ mod tests {
         AcpClient::spawn("cat", &[], &[], false)
             .await
             .expect("spawn cat as inert client")
+    }
+
+    fn agent_text_update_msg(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": text,
+                    },
+                },
+            }
+        })
+    }
+
+    fn tool_call_msg() -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "synthetic-tool-1",
+                    "title": "synthetic-tool",
+                    "kind": "execute",
+                },
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn turn_agent_text_collects_incremental_chunks() {
+        let mut client = spawn_inert_client().await;
+        client.handle_session_update(&agent_text_update_msg("Hello"));
+        client.handle_session_update(&agent_text_update_msg(" world"));
+
+        assert_eq!(
+            client.take_turn_agent_text().as_deref(),
+            Some("Hello world")
+        );
+        assert!(client.take_turn_agent_text().is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_agent_text_uses_final_segment_after_tool_call() {
+        let mut client = spawn_inert_client().await;
+        client.handle_session_update(&agent_text_update_msg("draft answer"));
+        client.handle_session_update(&tool_call_msg());
+        client.handle_session_update(&agent_text_update_msg("final answer"));
+
+        assert_eq!(
+            client.take_turn_agent_text().as_deref(),
+            Some("final answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_agent_text_keeps_pre_tool_text_when_no_final_segment_arrives() {
+        let mut client = spawn_inert_client().await;
+        client.handle_session_update(&agent_text_update_msg("answer to preserve"));
+        client.handle_session_update(&tool_call_msg());
+
+        assert_eq!(
+            client.take_turn_agent_text().as_deref(),
+            Some("answer to preserve")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_agent_text_truncates_on_a_utf8_boundary() {
+        let mut client = spawn_inert_client().await;
+        let prefix = "a".repeat(MAX_TURN_AGENT_TEXT_BYTES - 1);
+        client.handle_session_update(&agent_text_update_msg(&prefix));
+        client.handle_session_update(&agent_text_update_msg("é"));
+
+        let captured = client.take_turn_agent_text().expect("captured text");
+        assert_eq!(captured.len(), MAX_TURN_AGENT_TEXT_BYTES - 1);
+        assert!(captured.is_char_boundary(captured.len()));
     }
 
     /// Build a `session/update` JSON-RPC notification carrying a
