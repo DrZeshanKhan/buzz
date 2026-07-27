@@ -1824,6 +1824,7 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    let prompt_started_unix = chrono::Utc::now().timestamp().max(0) as u64;
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -1962,6 +1963,18 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        let turn_agent_text = agent.acp.take_turn_agent_text();
+                        if let (Some(batch), Some(text)) =
+                            (batch.as_ref(), turn_agent_text.as_deref())
+                        {
+                            ensure_visible_agent_reply(
+                                &ctx.rest_client,
+                                batch,
+                                text,
+                                prompt_started_unix,
+                            )
+                            .await;
+                        }
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -1990,6 +2003,14 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            let turn_agent_text = agent.acp.take_turn_agent_text();
+            if matches!(&stop_reason, StopReason::EndTurn | StopReason::Refusal) {
+                if let (Some(batch), Some(text)) = (batch.as_ref(), turn_agent_text.as_deref()) {
+                    ensure_visible_agent_reply(&ctx.rest_client, batch, text, prompt_started_unix)
+                        .await;
+                }
+            }
 
             let should_rotate = matches!(
                 stop_reason,
@@ -3529,6 +3550,159 @@ pub(crate) async fn post_failure_notice(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
         Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+    }
+}
+
+/// Ensure a successful channel turn leaves a visible reply.
+///
+/// Agents are normally instructed to publish through `buzz messages send`.
+/// Some providers occasionally return user-facing text without invoking that
+/// tool. This host-side fallback reuses the already-generated text and does
+/// not make another model request.
+async fn ensure_visible_agent_reply(
+    rest: &RestClient,
+    batch: &FlushBatch,
+    content: &str,
+    prompt_started_unix: u64,
+) {
+    use nostr::{Alphabet, SingleLetterTag, Timestamp};
+
+    let Some(trigger) = batch.events.last() else {
+        return;
+    };
+    let trigger_id = trigger.event.id;
+    let trigger_hex = trigger_id.to_hex();
+    let channel_id = batch.channel_id;
+    let agent_pubkey = rest.keys.public_key();
+    let e_tag = SingleLetterTag::lowercase(Alphabet::E);
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let channel_text = channel_id.to_string();
+    let message_kinds = [
+        nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+        nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+    ];
+
+    // The first filter catches an earlier reply to the same triggering event,
+    // including a fallback from a retried turn. The second catches a recent
+    // agent message that was posted without the required reply marker.
+    let exact_reply = nostr::Filter::new()
+        .kinds(message_kinds)
+        .author(agent_pubkey)
+        .custom_tags(e_tag, [trigger_hex.as_str()])
+        .custom_tags(h_tag, [channel_text.as_str()])
+        .limit(1);
+    let recent_channel_message = nostr::Filter::new()
+        .kinds(message_kinds)
+        .author(agent_pubkey)
+        .custom_tags(h_tag, [channel_text.as_str()])
+        .since(Timestamp::from_secs(prompt_started_unix.saturating_sub(1)))
+        .limit(1);
+
+    const FALLBACK_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+    let existing = match timeout(
+        FALLBACK_QUERY_TIMEOUT,
+        rest.query(&[exact_reply, recent_channel_message]),
+    )
+    .await
+    {
+        Ok(Ok(value)) => match value.as_array() {
+            Some(events) => !events.is_empty(),
+            None => {
+                tracing::warn!(
+                    target: "buzz_acp::fallback",
+                    channel = %channel_id,
+                    trigger = %trigger_hex,
+                    "reply fallback query returned an invalid response"
+                );
+                return;
+            }
+        },
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: "buzz_acp::fallback",
+                channel = %channel_id,
+                trigger = %trigger_hex,
+                "reply fallback query failed: {error}"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "buzz_acp::fallback",
+                channel = %channel_id,
+                trigger = %trigger_hex,
+                "reply fallback query timed out"
+            );
+            return;
+        }
+    };
+    if existing {
+        tracing::debug!(
+            target: "buzz_acp::fallback",
+            channel = %channel_id,
+            trigger = %trigger_hex,
+            "visible agent reply already exists"
+        );
+        return;
+    }
+
+    let parsed = crate::queue::parse_thread_tags(&trigger.event);
+    let root_id = parsed
+        .root_event_id
+        .as_deref()
+        .and_then(|value| nostr::EventId::from_hex(value).ok())
+        .unwrap_or(trigger_id);
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id: root_id,
+        parent_event_id: trigger_id,
+    };
+    let builder =
+        match buzz_sdk::build_message(channel_id, content, Some(&thread_ref), &[], false, &[]) {
+            Ok(builder) => builder,
+            Err(error) => {
+                tracing::warn!(
+                    target: "buzz_acp::fallback",
+                    channel = %channel_id,
+                    trigger = %trigger_hex,
+                    "reply fallback build failed: {error}"
+                );
+                return;
+            }
+        };
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(
+                target: "buzz_acp::fallback",
+                channel = %channel_id,
+                trigger = %trigger_hex,
+                "reply fallback signing failed: {error}"
+            );
+            return;
+        }
+    };
+
+    const FALLBACK_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+    match timeout(FALLBACK_SUBMIT_TIMEOUT, rest.submit_event(&event)).await {
+        Ok(Ok(_)) => tracing::info!(
+            target: "buzz_acp::fallback",
+            channel = %channel_id,
+            trigger = %trigger_hex,
+            event_id = %event.id.to_hex(),
+            "published host-side reply fallback"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            target: "buzz_acp::fallback",
+            channel = %channel_id,
+            trigger = %trigger_hex,
+            "reply fallback submission failed: {error}"
+        ),
+        Err(_) => tracing::warn!(
+            target: "buzz_acp::fallback",
+            channel = %channel_id,
+            trigger = %trigger_hex,
+            "reply fallback submission timed out"
+        ),
     }
 }
 
