@@ -1001,8 +1001,46 @@ pub async fn cmd_remove_channel_member(
     Ok(())
 }
 
-/// Set the channel addition policy — sign and submit a kind:10100 (agent profile) event.
-pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(), CliError> {
+const MAX_AGENT_PROFILE_JSON_BYTES: usize = 16 * 1024;
+
+fn build_agent_profile_content(
+    policy: &str,
+    profile_json: Option<&str>,
+) -> Result<String, CliError> {
+    let mut profile = match profile_json {
+        Some(raw) => {
+            if raw.len() > MAX_AGENT_PROFILE_JSON_BYTES {
+                return Err(CliError::Usage(format!(
+                    "--profile-json exceeds {MAX_AGENT_PROFILE_JSON_BYTES} bytes"
+                )));
+            }
+            let value: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|error| CliError::Usage(format!("invalid --profile-json: {error}")))?;
+            value.as_object().cloned().ok_or_else(|| {
+                CliError::Usage("--profile-json must be a JSON object".to_string())
+            })?
+        }
+        None => serde_json::Map::new(),
+    };
+
+    // The event author is authoritative. Do not persist a caller-supplied
+    // pubkey that could mislead older clients.
+    profile.remove("pubkey");
+    profile.insert(
+        "channel_add_policy".to_string(),
+        serde_json::Value::String(policy.to_string()),
+    );
+    serde_json::to_string(&profile)
+        .map_err(|error| CliError::Other(format!("agent profile serialization failed: {error}")))
+}
+
+/// Set the channel addition policy and optionally publish full agent-directory
+/// metadata in the same signed kind:10100 replacement event.
+pub async fn cmd_set_add_policy(
+    client: &BuzzClient,
+    policy: &str,
+    profile_json: Option<&str>,
+) -> Result<(), CliError> {
     match policy {
         "anyone" | "owner_only" | "nobody" => {}
         _ => {
@@ -1032,7 +1070,7 @@ pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(),
         }
     }
 
-    let content = serde_json::json!({ "channel_add_policy": policy }).to_string();
+    let content = build_agent_profile_content(policy, profile_json)?;
     use nostr::{EventBuilder, Kind};
     let builder = EventBuilder::new(
         Kind::Custom(buzz_sdk::kind::KIND_AGENT_PROFILE as u16),
@@ -1161,7 +1199,10 @@ pub async fn dispatch(
         ChannelsCmd::RemoveMember { channel, pubkey } => {
             cmd_remove_channel_member(client, &channel, &pubkey).await
         }
-        ChannelsCmd::SetAddPolicy { policy } => cmd_set_add_policy(client, &policy).await,
+        ChannelsCmd::SetAddPolicy {
+            policy,
+            profile_json,
+        } => cmd_set_add_policy(client, &policy, profile_json.as_deref()).await,
     }
 }
 
@@ -1176,10 +1217,10 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cardinality_rule, build_template_report, cmd_set_add_policy,
-        finalize_roster_resolution, name_matches, resolve_roster_with_archive_filter,
-        validate_ttl_seconds, ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution,
-        SkippedSlug,
+        apply_cardinality_rule, build_agent_profile_content, build_template_report,
+        cmd_set_add_policy, finalize_roster_resolution, name_matches,
+        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
+        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1342,6 +1383,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_profile_content_preserves_directory_fields_and_policy_wins() {
+        let test_only_allowlist_entry = "a".repeat(64);
+        let profile_json = serde_json::json!({
+            "name": "Directory Helper",
+            "agent_type": "automation",
+            "status": "online",
+            "respond_to": "allowlist",
+            "respond_to_allowlist": [test_only_allowlist_entry],
+            "channel_add_policy": "anyone",
+            "pubkey": "not-authoritative",
+        })
+        .to_string();
+        let content =
+            build_agent_profile_content("owner_only", Some(&profile_json)).expect("valid profile");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("profile JSON");
+
+        assert_eq!(value["name"], "Directory Helper");
+        assert_eq!(value["agent_type"], "automation");
+        assert_eq!(value["status"], "online");
+        assert_eq!(value["respond_to"], "allowlist");
+        assert_eq!(
+            value["respond_to_allowlist"],
+            serde_json::json!(["a".repeat(64)])
+        );
+        assert_eq!(value["channel_add_policy"], "owner_only");
+        assert!(value.get("pubkey").is_none());
+    }
+
+    #[test]
+    fn agent_profile_content_rejects_non_object_json() {
+        let error = build_agent_profile_content("owner_only", Some(r#"["Directory Helper"]"#))
+            .expect_err("array profile must fail");
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn agent_profile_content_rejects_invalid_json() {
+        let error = build_agent_profile_content("owner_only", Some("{"))
+            .expect_err("invalid profile must fail");
+        assert!(error.to_string().contains("invalid --profile-json"));
+    }
+
+    #[test]
+    fn agent_profile_content_rejects_oversized_json() {
+        let oversized = "x".repeat(super::MAX_AGENT_PROFILE_JSON_BYTES + 1);
+        let error = build_agent_profile_content("owner_only", Some(&oversized))
+            .expect_err("oversized profile must fail");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn agent_profile_content_without_metadata_keeps_legacy_shape() {
+        let content =
+            build_agent_profile_content("nobody", None).expect("legacy policy-only profile");
+        assert_eq!(content, r#"{"channel_add_policy":"nobody"}"#);
+    }
+
     // --- Integration test: full env-var → cmd_set_add_policy() path ---
     //
     // This test calls cmd_set_add_policy directly with the env var set. The function
@@ -1362,7 +1461,7 @@ mod tests {
     async fn set_add_policy_env_gate_rejects_disallowed_via_full_path() {
         std::env::set_var("BUZZ_ACP_ALLOWED_CHANNEL_ADD_POLICIES", "owner_only,nobody");
         let client = make_test_client();
-        let result = cmd_set_add_policy(&client, "anyone").await;
+        let result = cmd_set_add_policy(&client, "anyone", None).await;
         std::env::remove_var("BUZZ_ACP_ALLOWED_CHANNEL_ADD_POLICIES");
 
         assert!(
