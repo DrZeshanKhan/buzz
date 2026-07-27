@@ -27,6 +27,8 @@ web/dist/
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
 secrets/
 
 # OS junk
@@ -35,6 +37,7 @@ Thumbs.db
 
 # CI artifacts and tooling that the image doesn't need
 .cache/
+.hermit/
 coverage/
 dist/
 playwright-report/
