@@ -187,7 +187,7 @@ async function expectAgentProfileActionsHidden(
   ).toHaveCount(0);
 }
 
-test("@ trigger prioritizes channel members before runnable personas and other managed agents", async ({
+test("@ trigger prioritizes channel members before runnable personas and other mentionable agents", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -209,7 +209,7 @@ test("@ trigger prioritizes channel members before runnable personas and other m
 
   const dropdown = autocomplete(page);
   await expect(dropdown).toBeVisible();
-  await expect(dropdown.getByText("alice")).toHaveCount(0);
+  await expect(dropdown.getByText("alice")).toBeVisible();
   await expect(dropdown.getByText("bob")).toBeVisible();
   await expect(dropdown.getByText("Fizz")).toBeVisible();
   await expect(dropdown.getByText("charlie")).toBeVisible();
